@@ -124,6 +124,9 @@ pub(crate) struct ClientWriter {
     pub(crate) control: ClientControlWriter,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
     pub(crate) render: ClientRenderWriter,
+    /// True when this endpoint's hello requested the baseline-hash verified
+    /// scroll encoding (surface_scroll_v2). Terminal clients never set it.
+    pub(crate) surface_scroll_v2: bool,
 }
 
 impl ClientWriter {
@@ -173,6 +176,7 @@ impl ClientWriter {
         let writer = Self {
             control: control_writer,
             render: render_writer,
+            surface_scroll_v2: false,
         };
         std::thread::spawn(move || {
             while let Some(item) = drain.recv() {
@@ -787,6 +791,7 @@ pub(crate) fn handle_client_handshake(
                     hello.surface_reuse,
                     hello.surface_delta,
                     hello.surface_scroll,
+                    hello.surface_scroll_v2,
                 )),
             )
         }
@@ -859,6 +864,7 @@ pub(crate) fn handle_client_handshake(
     let writer = ClientWriter {
         control: ClientControlWriter::queue(writer_queue.clone()),
         render: ClientRenderWriter::queue(writer_queue.clone()),
+        surface_scroll_v2: shell_options.as_ref().is_some_and(|options| options.8),
     };
 
     // Spawn a writer thread that forwards messages from the channels to the stream.
@@ -884,6 +890,7 @@ pub(crate) fn handle_client_handshake(
         surface_reuse,
         surface_delta,
         surface_scroll,
+        _,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -1477,6 +1484,7 @@ mod tests {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_scroll_v2: false,
             snapshot_codecs: vec![crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
@@ -1525,6 +1533,7 @@ mod tests {
             ClientWriter {
                 control: ClientControlWriter::queue(queue.clone()),
                 render: ClientRenderWriter::queue(queue.clone()),
+                surface_scroll_v2: false,
             },
             queue,
         )

@@ -1942,6 +1942,9 @@ impl HeadlessServer {
                     width_px: cell_width_px,
                     height_px: cell_height_px,
                 };
+                // The endpoint hello negotiates the v2 scroll encoding on the
+                // writer handle; the connect event itself stays v1-shaped.
+                let surface_scroll_v2 = writer.surface_scroll_v2;
                 let mut connection = ClientConnection::new_with_mode(
                     ClientConnectionMode::ClientShell,
                     (surface_cols, surface_rows),
@@ -1960,6 +1963,9 @@ impl HeadlessServer {
                 connection
                     .render_state
                     .enable_surface_scroll(surface_scroll);
+                connection
+                    .render_state
+                    .enable_surface_scroll_v2(surface_scroll_v2);
                 connection.shell_projection_revision = 1;
                 let config_diagnostic = if endpoint_keybindings {
                     self.server_config_diagnostic.as_deref()

@@ -108,13 +108,15 @@ impl Decoder {
                 return self.decode_delta(&data).map(ServerMessage::PaneSurface);
             }
             ServerMessage::EndpointControl { kind, data }
-                if kind == super::surface_scroll::MESSAGE_KIND =>
+                if kind == super::surface_scroll::MESSAGE_KIND
+                    || kind == super::surface_scroll::MESSAGE_KIND_V2 =>
             {
                 if !self.surface_scroll {
                     return Err("surface scroll was not negotiated".into());
                 }
+                let v2 = kind == super::surface_scroll::MESSAGE_KIND_V2;
                 return self
-                    .decode_scroll(&data)
+                    .decode_scroll(&data, v2)
                     .map(ServerMessage::PaneSurfacePatch);
             }
             ServerMessage::EndpointControl { kind, data } if kind == MESSAGE_KIND => {
@@ -182,11 +184,15 @@ impl Decoder {
         Ok(message)
     }
 
-    fn decode_scroll(&mut self, data: &str) -> Result<super::PaneSurfacePatch, String> {
+    fn decode_scroll(&mut self, data: &str, v2: bool) -> Result<super::PaneSurfacePatch, String> {
         let Some(base) = &mut self.baseline else {
             return Err("surface scroll without a baseline".into());
         };
-        let scroll = super::surface_scroll::decode(data)?;
+        let scroll = if v2 {
+            super::surface_scroll::decode_v2(data)?
+        } else {
+            super::surface_scroll::decode(data)?
+        };
         if !base.matches_patch(&scroll.patch) {
             return Err("surface scroll does not match its baseline".into());
         }

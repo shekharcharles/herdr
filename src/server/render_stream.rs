@@ -20,6 +20,7 @@ pub(crate) enum ClientRenderState {
         surface_reuse: bool,
         surface_delta: bool,
         surface_scroll: bool,
+        surface_scroll_v2: bool,
         recompute_pending: bool,
     },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
@@ -39,6 +40,7 @@ impl ClientRenderState {
                 surface_reuse: false,
                 surface_delta: false,
                 surface_scroll: false,
+                surface_scroll_v2: false,
                 recompute_pending: false,
             },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
@@ -64,6 +66,12 @@ impl ClientRenderState {
     pub(crate) fn enable_surface_scroll(&mut self, enabled: bool) {
         if let Self::Semantic { surface_scroll, .. } = self {
             *surface_scroll = enabled;
+        }
+    }
+
+    pub(crate) fn enable_surface_scroll_v2(&mut self, enabled: bool) {
+        if let Self::Semantic { surface_scroll_v2, .. } = self {
+            *surface_scroll_v2 = enabled;
         }
     }
 
@@ -249,6 +257,7 @@ impl ClientRenderState {
             last_surface,
             surface_revision,
             surface_scroll,
+            surface_scroll_v2,
             ..
         } = self
         else {
@@ -266,8 +275,16 @@ impl ClientRenderState {
         }
         let next_revision = surface_revision.saturating_add(1);
         patch.surface_revision = next_revision;
+        // v2 rides the same negotiation gate as v1 and only replaces the
+        // encoder once the hello asked for baseline-hash verified scrolls.
         let scrolled = (*surface_scroll)
-            .then(|| crate::protocol::surface_scroll::message(last, &patch))
+            .then(|| {
+                if *surface_scroll_v2 {
+                    crate::protocol::surface_scroll::message_v2(last, &patch)
+                } else {
+                    crate::protocol::surface_scroll::message(last, &patch)
+                }
+            })
             .flatten();
         Some(match scrolled {
             Some(message) => PreparedRender::SemanticPatch {

@@ -14,12 +14,18 @@ use super::{
 
 pub(crate) const CAPABILITY: &str = "surface_scroll";
 pub(crate) const MESSAGE_KIND: &str = "endpoint.surface-scroll.v1";
+pub(crate) const MESSAGE_KIND_V2: &str = "endpoint.surface-scroll.v2";
 
-// This byte layout is frozen with MESSAGE_KIND: one count byte, then per
+// The v1 byte layout is frozen with MESSAGE_KIND: one count byte, then per
 // scroll x, y, width, height (u16 LE) and shift (i16 LE), then one framed
 // `ServerMessage::PaneSurfacePatch` decoded by the shared bounded reader.
+// MESSAGE_KIND_V2 keeps that block byte-identical and adds one section
+// between the scroll block and the framed message: per scroll, in scroll
+// order, the 8-byte little-endian pre-rotation baseline fingerprint of the
+// scroll's rect rows from `rect_baseline_hash`.
 const MAX_SCROLLS: usize = 64;
 const SCROLL_BYTES: usize = 10;
+const HASH_BYTES: usize = 8;
 
 /// Reorders the rows of one pane region before the patch rows apply.
 ///
@@ -36,6 +42,10 @@ pub(crate) struct SurfaceScroll {
 pub(crate) struct ScrollPatch {
     pub(crate) scrolls: Vec<SurfaceScroll>,
     pub(crate) patch: PaneSurfacePatch,
+    /// Per-scroll fingerprint of the sender's pre-rotation rect rows, sent
+    /// only by [`MESSAGE_KIND_V2`] messages and verified by [`apply`] before
+    /// anything rotates. Empty for v1.
+    pub(crate) hashes: Vec<u64>,
 }
 
 /// The row swaps that define [`SurfaceScroll`]. Both peers must derive the
@@ -126,6 +136,10 @@ impl RowView<'_> {
 
 // Row fingerprints only nominate a shift; the residual diff compares real
 // cells, so a collision can cost bytes but never correctness.
+// The baseline fingerprints below reuse these primitives. A 64-bit collision
+// lets a drifted baseline past the v2 guard exactly as the unguarded v1 path
+// allows today, so the hashes buy detection odds, never correctness; a
+// detected mismatch only costs the existing disconnect-and-resync.
 fn mix(hash: u64, value: u64) -> u64 {
     (hash.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95)
 }
@@ -142,6 +156,35 @@ fn cell_hash(hash: u64, cell: &CellData) -> u64 {
             | u64::from(cell.skip) << 16
             | cell.hyperlink.map_or(0, |index| u64::from(index) + 1) << 17,
     )
+}
+
+/// Deterministic fingerprint of the rows of `rect` before any rotation,
+/// folded with the same [`RowView::hash`] primitives so sender and receiver
+/// agree byte for byte. The row selection mirrors [`apply_scroll`], so both
+/// peers hash identical bytes for identical grids; returns `None` when the
+/// grid is too small to hold `rect`.
+///
+/// The fields [`cell_hash`] folds stay comparable on this path because the
+/// retained renderer refuses to patch rows whose hyperlinks changed, and
+/// every patch overlays both grids with the same absolute hyperlink indices.
+pub(crate) fn rect_baseline_hash(
+    cells: &[CellData],
+    width: u16,
+    rect: SurfaceRect,
+) -> Option<u64> {
+    let stride = usize::from(width);
+    let row_start = |y: usize| {
+        (usize::from(rect.y) + y)
+            .checked_mul(stride)?
+            .checked_add(usize::from(rect.x))
+    };
+    let mut hash = 0;
+    for y in 0..usize::from(rect.height) {
+        let start = row_start(y)?;
+        let end = start.checked_add(usize::from(rect.width))?;
+        hash = cells.get(start..end)?.iter().fold(hash, cell_hash);
+    }
+    Some(hash)
 }
 
 fn fully_inside(row: &PaneSurfacePatchRow, rect: SurfaceRect) -> bool {
@@ -274,6 +317,26 @@ fn encoded_size(value: &impl serde::Serialize) -> Option<usize> {
 /// when some pane's shift at least halves its patched cells. Returns `None`
 /// otherwise, so ordinary edits never pay for the wrapper.
 pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Option<ServerMessage> {
+    encode(last, patch, false)
+}
+
+/// Encodes `patch` as a [`MESSAGE_KIND_V2`] message: [`message`]'s exact
+/// bytes plus one pre-rotation baseline fingerprint per scroll, so a receiver
+/// whose grid drifted from `last` rejects the scroll instead of splicing
+/// rows. Returns `None`, falling back to a plain patch, whenever [`message`]
+/// would, or when a rect cannot be hashed.
+pub(crate) fn message_v2(
+    last: &PaneSurfaceFrame,
+    patch: &PaneSurfacePatch,
+) -> Option<ServerMessage> {
+    encode(last, patch, true)
+}
+
+fn encode(
+    last: &PaneSurfaceFrame,
+    patch: &PaneSurfacePatch,
+    with_hashes: bool,
+) -> Option<ServerMessage> {
     let frame = &last.frame;
     if frame.cells.len() != usize::from(frame.width) * usize::from(frame.height) {
         return None;
@@ -302,6 +365,12 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
     if scrolls.is_empty() {
         return None;
     }
+    let mut hashes = Vec::new();
+    if with_hashes {
+        for scroll in &scrolls {
+            hashes.push(rect_baseline_hash(&frame.cells, frame.width, scroll.rect)?);
+        }
+    }
 
     // Rows that straddle a scrolled region keep their final values, so they
     // stay in the patch and apply after the scroll.
@@ -321,7 +390,8 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
         panes: patch.panes.clone(),
         cursor: patch.cursor.clone(),
     });
-    let mut bytes = Vec::with_capacity(1 + scrolls.len() * SCROLL_BYTES);
+    let mut bytes =
+        Vec::with_capacity(1 + scrolls.len() * SCROLL_BYTES + hashes.len() * HASH_BYTES);
     bytes.push(scrolls.len() as u8);
     for scroll in &scrolls {
         let rect = scroll.rect;
@@ -330,9 +400,12 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
         }
         bytes.extend_from_slice(&scroll.shift.to_le_bytes());
     }
+    for hash in &hashes {
+        bytes.extend_from_slice(&hash.to_le_bytes());
+    }
     super::write_message(&mut bytes, &inner).ok()?;
     let message = ServerMessage::EndpointControl {
-        kind: MESSAGE_KIND.into(),
+        kind: (if with_hashes { MESSAGE_KIND_V2 } else { MESSAGE_KIND }).into(),
         data: STANDARD_NO_PAD.encode(bytes),
     };
     (encoded_size(&message)? <= MAX_FRAME_SIZE).then_some(message)
@@ -341,6 +414,16 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
 /// Decodes one scroll message. Geometry is validated against the receiver's
 /// baseline by [`apply`], never trusted here.
 pub(crate) fn decode(data: &str) -> Result<ScrollPatch, String> {
+    decode_layout(data, false)
+}
+
+/// Decodes one v2 scroll message: the v1 layout plus one baseline hash per
+/// scroll, which [`apply`] verifies against its own grid before rotating.
+pub(crate) fn decode_v2(data: &str) -> Result<ScrollPatch, String> {
+    decode_layout(data, true)
+}
+
+fn decode_layout(data: &str, with_hashes: bool) -> Result<ScrollPatch, String> {
     let limit = base64::encoded_len(MAX_FRAME_SIZE, false).unwrap_or(usize::MAX);
     if data.len() > limit {
         return Err("surface scroll exceeds the frame limit".into());
@@ -352,11 +435,17 @@ pub(crate) fn decode(data: &str) -> Result<ScrollPatch, String> {
     if count == 0 || count > MAX_SCROLLS {
         return Err("surface scroll has an invalid scroll count".into());
     }
-    let header = 1 + count * SCROLL_BYTES;
+    let rects_end = 1 + count * SCROLL_BYTES;
+    let header = if with_hashes { rects_end + count * HASH_BYTES } else { rects_end };
     if bytes.len() < header {
-        return Err("surface scroll is truncated".into());
+        return Err((if with_hashes {
+            "surface scroll v2 is truncated"
+        } else {
+            "surface scroll is truncated"
+        })
+        .into());
     }
-    let scrolls = bytes[1..header]
+    let scrolls = bytes[1..rects_end]
         .chunks_exact(SCROLL_BYTES)
         .map(|chunk| {
             let value = |at: usize| u16::from_le_bytes([chunk[at], chunk[at + 1]]);
@@ -371,13 +460,30 @@ pub(crate) fn decode(data: &str) -> Result<ScrollPatch, String> {
             }
         })
         .collect();
+    let hashes = if with_hashes {
+        bytes[rects_end..header]
+            .chunks_exact(HASH_BYTES)
+            .map(|chunk| {
+                let mut hash = [0; HASH_BYTES];
+                hash.copy_from_slice(chunk);
+                u64::from_le_bytes(hash)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut frame = &bytes[header..];
     let decoded = super::read_message::<_, ServerMessage>(&mut frame, MAX_FRAME_SIZE);
     if !frame.is_empty() {
-        return Err("surface scroll has trailing bytes".into());
+        return Err((if with_hashes {
+            "surface scroll v2 has trailing bytes"
+        } else {
+            "surface scroll has trailing bytes"
+        })
+        .into());
     }
     match decoded {
-        Ok(ServerMessage::PaneSurfacePatch(patch)) => Ok(ScrollPatch { scrolls, patch }),
+        Ok(ServerMessage::PaneSurfacePatch(patch)) => Ok(ScrollPatch { scrolls, patch, hashes }),
         Ok(_) => Err("surface scroll does not carry a pane patch".into()),
         Err(error) => Err(format!("invalid surface scroll patch: {error}")),
     }
@@ -392,7 +498,7 @@ pub(crate) fn apply(
     height: u16,
     scroll_patch: ScrollPatch,
 ) -> Result<PaneSurfacePatch, String> {
-    let ScrollPatch { scrolls, mut patch } = scroll_patch;
+    let ScrollPatch { scrolls, mut patch, hashes } = scroll_patch;
     if cells.len() != usize::from(width) * usize::from(height) {
         return Err("surface scroll baseline has an invalid grid".into());
     }
@@ -403,6 +509,19 @@ pub(crate) fn apply(
         || !patch.rows.iter().all(|row| row_fits(row, width, height))
     {
         return Err("surface scroll exceeds the cell baseline".into());
+    }
+    // v2 sends the sender's fingerprint of these rect rows before its own
+    // rotation: recompute every rect against our grid before mutating
+    // anything, so a mismatch leaves the grid byte-identical and rides the
+    // framing error into a disconnect and a full resync.
+    if !hashes.is_empty() {
+        for (scroll, hash) in scrolls.iter().zip(&hashes) {
+            if rect_baseline_hash(cells, width, scroll.rect)
+                .is_none_or(|computed| computed != *hash)
+            {
+                return Err("surface scroll baseline hash mismatch".into());
+            }
+        }
     }
     for scroll in &scrolls {
         apply_scroll(cells, width, scroll);
@@ -579,14 +698,38 @@ mod tests {
     }
 
     fn round_trip(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> (usize, FrameData) {
-        let message = message(last, patch).expect("scroll message");
+        round_trip_kind(last, patch, false)
+    }
+
+    fn round_trip_v2(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> (usize, FrameData) {
+        round_trip_kind(last, patch, true)
+    }
+
+    fn round_trip_kind(
+        last: &PaneSurfaceFrame,
+        patch: &PaneSurfacePatch,
+        v2: bool,
+    ) -> (usize, FrameData) {
+        let message = (if v2 {
+            message_v2(last, patch)
+        } else {
+            message(last, patch)
+        })
+        .expect("scroll message");
         let size = encoded_size(&message).unwrap();
         let ServerMessage::EndpointControl { kind, data } = message else {
             panic!("scroll must be an endpoint control frame");
         };
-        assert_eq!(kind, MESSAGE_KIND);
+        assert_eq!(kind, if v2 { MESSAGE_KIND_V2 } else { MESSAGE_KIND });
         let mut cells = last.frame.cells.clone();
-        let expanded = apply(&mut cells, WIDTH, HEIGHT, decode(&data).unwrap()).unwrap();
+        let decoded = (if v2 {
+            decode_v2(&data)
+        } else {
+            decode(&data)
+        })
+        .unwrap();
+        assert_eq!(!decoded.hashes.is_empty(), v2);
+        let expanded = apply(&mut cells, WIDTH, HEIGHT, decoded).unwrap();
         // A receiver without scroll support must reach the same grid.
         let mut plain = last.frame.clone();
         for row in &expanded.rows {
@@ -716,5 +859,262 @@ mod tests {
         assert!(decode("").is_err());
         assert!(decode(&STANDARD_NO_PAD.encode([0u8])).is_err());
         assert!(decode(&STANDARD_NO_PAD.encode([1u8, 0, 0])).is_err());
+    }
+
+    /// A scrolled-output frame the retained renderer would send as a scroll.
+    fn scrolled_case() -> (PaneSurfaceFrame, PaneSurfacePatch, FrameData) {
+        let last = surface();
+        let mut next = last.frame.clone();
+        for y in 0..PANE.height {
+            write(&mut next, y, &line(i32::from(y) + 1));
+        }
+        let patch = row_patch(&last, &next);
+        (last, patch, next)
+    }
+
+    fn v2_data(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> String {
+        let Some(ServerMessage::EndpointControl { kind, data }) = message_v2(last, patch) else {
+            panic!("scroll message");
+        };
+        assert_eq!(kind, MESSAGE_KIND_V2);
+        data
+    }
+
+    fn empty_patch() -> PaneSurfacePatch {
+        PaneSurfacePatch {
+            boot_id: "boot".into(),
+            projection_revision: 1,
+            base_surface_revision: 1,
+            surface_revision: 2,
+            rows: Vec::new(),
+            panes: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    fn assert_kinds_agree(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch, expected: &FrameData) {
+        let (_, v1) = round_trip(last, patch);
+        let (_, v2) = round_trip_v2(last, patch);
+        assert_eq!(v1.cells, expected.cells, "v1 expansion");
+        assert_eq!(v2.cells, expected.cells, "v2 expansion");
+    }
+
+    #[test]
+    fn v2_expansion_matches_v1_for_up_down_and_border_crossing() {
+        let (last, patch, next) = scrolled_case();
+        assert_kinds_agree(&last, &patch, &next);
+
+        let last = surface();
+        let mut next = last.frame.clone();
+        for y in 0..PANE.height {
+            write(&mut next, y, &line(i32::from(y) - 2));
+        }
+        write(&mut next, 5, "edited in place");
+        assert_kinds_agree(&last, &row_patch(&last, &next), &next);
+
+        // A full-width border row that crosses the scrolled region.
+        let (last, mut patch, next) = scrolled_case();
+        let y = PANE.y + 4;
+        let start = usize::from(y) * usize::from(WIDTH);
+        patch.rows.push(PaneSurfacePatchRow {
+            x: 0,
+            y,
+            cells: next.cells[start..start + usize::from(WIDTH)].to_vec(),
+        });
+        assert_kinds_agree(&last, &patch, &next);
+    }
+
+    #[test]
+    fn v2_wraps_the_frozen_v1_bytes_with_a_hash_block() {
+        let (last, patch, _) = scrolled_case();
+        let data = v2_data(&last, &patch);
+        let Some(ServerMessage::EndpointControl { data: v1, .. }) = message(&last, &patch) else {
+            panic!("scroll message");
+        };
+        let (v2, v1) = (
+            STANDARD_NO_PAD.decode(data).unwrap(),
+            STANDARD_NO_PAD.decode(v1).unwrap(),
+        );
+        let count = usize::from(v1[0]);
+        assert!(count > 0 && count <= MAX_SCROLLS);
+        assert_eq!(usize::from(v2[0]), count);
+        let rects = 1 + count * SCROLL_BYTES;
+        let hashes = rects + count * HASH_BYTES;
+        assert_eq!(&v2[..rects], &v1[..rects], "v1 rect block must stay frozen");
+        assert_eq!(
+            &v2[hashes..],
+            &v1[rects..],
+            "the framed patch must follow the hash block byte-identical to v1",
+        );
+        for (index, chunk) in v2[1..rects].chunks_exact(SCROLL_BYTES).enumerate() {
+            let value = |at: usize| u16::from_le_bytes([chunk[at], chunk[at + 1]]);
+            let rect = SurfaceRect {
+                x: value(0),
+                y: value(2),
+                width: value(4),
+                height: value(6),
+            };
+            let mut hash = [0; HASH_BYTES];
+            let block = rects + index * HASH_BYTES..rects + (index + 1) * HASH_BYTES;
+            hash.copy_from_slice(&v2[block]);
+            assert_eq!(
+                Some(u64::from_le_bytes(hash)),
+                rect_baseline_hash(&last.frame.cells, WIDTH, rect),
+                "the wire hash must be the baseline fingerprint of its rect",
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_cell_inside_a_rect_is_rejected_before_rotation() {
+        let (last, patch, _) = scrolled_case();
+        let decoded = decode_v2(&v2_data(&last, &patch)).unwrap();
+        assert!(!decoded.hashes.is_empty());
+        let mut cells = last.frame.cells.clone();
+        // The receiver's grid drifted inside the scrolled region without any
+        // revision chain proof at all: only the fingerprint can see it.
+        let at = usize::from(PANE.y + 3) * usize::from(WIDTH) + usize::from(PANE.x + 5);
+        cells[at].symbol = "!".into();
+        let before = cells.clone();
+        assert_eq!(
+            apply(&mut cells, WIDTH, HEIGHT, decoded).unwrap_err(),
+            "surface scroll baseline hash mismatch",
+        );
+        assert_eq!(cells, before, "a rejected scroll must not rotate rows");
+    }
+
+    #[test]
+    fn drift_at_every_rect_edge_is_detected() {
+        let (last, patch, _) = scrolled_case();
+        let data = v2_data(&last, &patch);
+        for (x, y) in [
+            (PANE.x, PANE.y),
+            (PANE.x + PANE.width - 1, PANE.y),
+            (PANE.x, PANE.y + PANE.height - 1),
+            (PANE.x + PANE.width - 1, PANE.y + PANE.height - 1),
+        ] {
+            let mut cells = last.frame.cells.clone();
+            cells[usize::from(y) * usize::from(WIDTH) + usize::from(x)].symbol = "!".into();
+            let before = cells.clone();
+            assert!(
+                apply(&mut cells, WIDTH, HEIGHT, decode_v2(&data).unwrap()).is_err(),
+                "edge drift at ({x}, {y}) must be rejected",
+            );
+            assert_eq!(cells, before);
+        }
+    }
+
+    #[test]
+    fn one_mismatched_rect_rejects_the_whole_patch_untouched() {
+        let (last, patch, _) = scrolled_case();
+        let mut decoded = decode_v2(&v2_data(&last, &patch)).unwrap();
+        // A second region in the untouched right margin the sender also
+        // scrolled, hashed against a grid the receiver no longer holds.
+        let extra = SurfaceRect {
+            x: 22,
+            y: 0,
+            width: 8,
+            height: 12,
+        };
+        decoded.scrolls.push(SurfaceScroll {
+            rect: extra,
+            shift: 2,
+        });
+        decoded.hashes.push(
+            rect_baseline_hash(&last.frame.cells, WIDTH, extra).expect("rect fits the grid") ^ 1,
+        );
+        let mut cells = last.frame.cells.clone();
+        let before = cells.clone();
+        assert_eq!(
+            apply(&mut cells, WIDTH, HEIGHT, decoded).unwrap_err(),
+            "surface scroll baseline hash mismatch",
+        );
+        assert_eq!(cells, before, "the matching rect must not rotate either");
+    }
+
+    #[test]
+    fn a_tampered_wire_hash_is_rejected_before_rotation() {
+        let (last, patch, _) = scrolled_case();
+        let mut bytes = STANDARD_NO_PAD.decode(&v2_data(&last, &patch)).unwrap();
+        let count = usize::from(bytes[0]);
+        // Flip the top bit of the first rect's fingerprint.
+        bytes[1 + count * SCROLL_BYTES] ^= 0x80;
+        let decoded = decode_v2(&STANDARD_NO_PAD.encode(bytes)).unwrap();
+        let mut cells = last.frame.cells.clone();
+        assert_eq!(
+            apply(&mut cells, WIDTH, HEIGHT, decoded).unwrap_err(),
+            "surface scroll baseline hash mismatch",
+        );
+        assert_eq!(cells, last.frame.cells);
+    }
+
+    #[test]
+    fn a_max_scroll_patch_of_min_rects_verifies_and_rotates() {
+        let last = surface();
+        let mut scrolls = Vec::new();
+        let mut hashes = Vec::new();
+        for y in (0..HEIGHT).step_by(2) {
+            for x in (0..WIDTH).step_by(2) {
+                let rect = SurfaceRect { x, y, width: 2, height: 2 };
+                // Minimum-size rects and both shift directions.
+                let shift = if scrolls.len() % 3 == 0 { -1 } else { 1 };
+                scrolls.push(SurfaceScroll { rect, shift });
+                hashes.push(
+                    rect_baseline_hash(&last.frame.cells, WIDTH, rect).expect("rect fits the grid"),
+                );
+            }
+        }
+        assert!(scrolls.len() > MAX_SCROLLS, "fixture must overflow the cap");
+        scrolls.truncate(MAX_SCROLLS);
+        hashes.truncate(MAX_SCROLLS);
+        let mut expected = last.frame.cells.clone();
+        for scroll in &scrolls {
+            apply_scroll(&mut expected, WIDTH, scroll);
+        }
+        let mut cells = last.frame.cells.clone();
+        let expanded = apply(
+            &mut cells,
+            WIDTH,
+            HEIGHT,
+            ScrollPatch {
+                scrolls: scrolls.clone(),
+                patch: empty_patch(),
+                hashes,
+            },
+        )
+        .expect("a verified 64-rect v2 patch must apply");
+        assert_eq!(
+            cells, expected,
+            "verified scrolls must rotate exactly as v1 does",
+        );
+        assert_disjoint(&expanded.rows);
+        assert_eq!(
+            expanded.rows.iter().map(|row| row.cells.len()).sum::<usize>(),
+            MAX_SCROLLS * 4,
+        );
+    }
+
+    #[test]
+    fn v2_header_errors_are_tagged_and_v1_strings_stay_frozen() {
+        let (last, patch, _) = scrolled_case();
+        let bytes = STANDARD_NO_PAD.decode(&v2_data(&last, &patch)).unwrap();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_v2(&STANDARD_NO_PAD.encode(trailing)).unwrap_err(),
+            "surface scroll v2 has trailing bytes",
+        );
+        assert_eq!(
+            decode_v2(&STANDARD_NO_PAD.encode([1u8, 0, 0])).unwrap_err(),
+            "surface scroll v2 is truncated",
+        );
+        assert_eq!(
+            decode_v2(&STANDARD_NO_PAD.encode([65u8])).unwrap_err(),
+            "surface scroll has an invalid scroll count",
+        );
+        assert_eq!(
+            decode(&STANDARD_NO_PAD.encode([1u8, 0, 0])).unwrap_err(),
+            "surface scroll is truncated",
+        );
     }
 }
