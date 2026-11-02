@@ -200,6 +200,7 @@ pub const MODE_COLOR_SCHEME_REPORT: u16 = 2031;
 // These are documented in vendor/libghostty-vt/include/ghostty/vt/terminal.h,
 // but the generated bindings do not currently expose named constants for them.
 const TERMINAL_DATA_COLOR_FOREGROUND: ffi::GhosttyTerminalData = 18;
+const TERMINAL_DATA_COLOR_BACKGROUND: ffi::GhosttyTerminalData = 19;
 const TERMINAL_DATA_COLOR_CURSOR: ffi::GhosttyTerminalData = 20;
 
 const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
@@ -1759,6 +1760,10 @@ impl Terminal {
 
     pub fn effective_foreground_color(&self) -> Result<Option<RgbColor>, Error> {
         self.get_optional_rgb_color(TERMINAL_DATA_COLOR_FOREGROUND)
+    }
+
+    pub fn effective_background_color(&self) -> Result<Option<RgbColor>, Error> {
+        self.get_optional_rgb_color(TERMINAL_DATA_COLOR_BACKGROUND)
     }
 
     pub fn effective_cursor_color(&self) -> Result<Option<RgbColor>, Error> {
@@ -5075,5 +5080,107 @@ mod tests {
         assert!(basic.has_styling);
         assert_eq!(basic.style.fg_color, Some(CellColor::Palette(1)));
         assert!(!basic.has_hyperlink);
+    }
+
+    fn clear_all_row_dirty(render_state: &mut RenderState) {
+        let mut iterator = RowIterator::new().unwrap();
+        let mut rows = render_state.populate_row_iterator(&mut iterator).unwrap();
+        while rows.next() {
+            rows.clear_dirty().unwrap();
+        }
+    }
+
+    /// Invariant: a viewport-full scroll rotation changes EVERY visible row, so
+    /// every row must be dirty. A missed row is invisible to herdr's collect
+    /// loop (it only sees next_dirty rows) and stays client-stale until a
+    /// full render.
+    #[test]
+    fn scroll_rotation_marks_every_visible_row_dirty() {
+        let mut terminal = Terminal::new(8, 4, 100).unwrap();
+        let mut render_state = RenderState::new().unwrap();
+        render_state.update(&terminal).unwrap();
+        clear_all_row_dirty(&mut render_state);
+        render_state.set_dirty(Dirty::Clean).unwrap();
+
+        for n in 0..4u8 {
+            terminal.write(format!("ROW{n}\r\n").as_bytes());
+        }
+        render_state.update(&terminal).unwrap();
+        clear_all_row_dirty(&mut render_state);
+        render_state.set_dirty(Dirty::Clean).unwrap();
+
+        // Force scroll-up with the bottom line filled: every row shifts.
+        terminal.write(b"ROWX\r\n");
+        render_state.update(&terminal).unwrap();
+
+        let mut iterator = RowIterator::new().unwrap();
+        let mut rows = render_state.populate_row_iterator(&mut iterator).unwrap();
+        let mut dirty = Vec::new();
+        while let Some(y) = rows.next_dirty() {
+            dirty.push(y);
+        }
+        assert_eq!(
+            dirty,
+            vec![0, 1, 2, 3],
+            "scroll rotation moved all 4 visible rows but RenderState marked only {dirty:?}"
+        );
+
+        // Content oracle (independent of the dirty claim): the scrolled-in
+        // line is visible in the bottom h rows of screen text.
+        let rows_text = terminal.screen_text_rows().unwrap();
+        let viewport: Vec<String> = rows_text
+            .iter()
+            .rev()
+            .take(4)
+            .rev()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|c| {
+                        c.graphemes
+                            .iter()
+                            .filter_map(|g| char::from_u32(*g))
+                            .collect::<String>()
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            viewport.iter().any(|r| r.contains("ROWX")),
+            "viewport text lost the scrolled-in line: {viewport:?}"
+        );
+    }
+
+    /// Invariant: herdr's collect loop iterates ONLY row bits, then UNCONDITIONALLY
+    /// sets the whole render state Clean (pane/terminal.rs collect). A
+    /// Partial/Full signal with zero dirty row bits is therefore silently
+    /// destroyed. Ghostty must never signal work without row bits.
+    #[test]
+    fn partial_dirty_always_carries_row_bits() {
+        let mut terminal = Terminal::new(8, 3, 100).unwrap();
+        let mut render_state = RenderState::new().unwrap();
+        render_state.update(&terminal).unwrap();
+        clear_all_row_dirty(&mut render_state);
+        render_state.set_dirty(Dirty::Clean).unwrap();
+
+        // SGR bg + erase-in-line to end: repaints a row region with pen
+        // colors and NO cell writes (status-bar class of output).
+        terminal.write(b"\x1b[41mred\x1b[K\r\n\x1b[0m");
+        render_state.update(&terminal).unwrap();
+        let whole = render_state.dirty().unwrap();
+        let any_row = {
+            let mut iterator = RowIterator::new().unwrap();
+            let mut rows = render_state.populate_row_iterator(&mut iterator).unwrap();
+            let mut any = false;
+            while rows.next() {
+                any |= rows.dirty().unwrap();
+            }
+            any
+        };
+        assert!(
+            matches!(whole, Dirty::Clean) || any_row,
+            "RenderState signalled {whole:?} with zero dirty rows; herdr's collect \
+             returns an empty patch and sets Clean, losing the repaint"
+        );
     }
 }

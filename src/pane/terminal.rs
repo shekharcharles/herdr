@@ -17,6 +17,8 @@ use crate::protocol::CellData;
 
 #[cfg(test)]
 mod migration_tests;
+#[cfg(test)]
+mod blank_fidelity_tests;
 #[cfg(windows)]
 mod windows_recent_fallback;
 
@@ -117,6 +119,50 @@ pub(crate) enum TerminalDirtyPatchOutcome {
     Fallback,
 }
 
+/// Shared per-cell extraction used by the full render and EVERY patch
+/// collect path (including the default-color forced re-push): the style and
+/// display symbol for the cell the iterator sits on, blank-symbol-on-error
+/// in both. A patch row therefore equals a full recomposition BY
+/// CONSTRUCTION; future changes to cell extraction update both surfaces at
+/// once and cannot skew them. Expanded at each call site (rather than a
+/// function) so the scratch-string re-borrows keep the exact inline shape
+/// both loops already compiled with.
+macro_rules! ghostty_cell_symbol_and_style {
+    (
+        $cells:expr,
+        $basic:expr,
+        $wide:expr,
+        $defaults:expr,
+        $grapheme_bytes:expr,
+        $symbol_scratch:expr
+    ) => {{
+        let style = ghostty_cell_style(
+            &$cells,
+            &$basic,
+            $defaults.default_fg,
+            $defaults.default_bg,
+            $defaults.resolved_fg,
+            $defaults.resolved_bg,
+            $defaults.palette_overrides.as_ref(),
+        );
+        let symbol = match ghostty_buffer_symbol_into(
+            &$cells,
+            $wide,
+            $defaults.hide_kitty_placeholders,
+            &mut $grapheme_bytes,
+            &mut $symbol_scratch,
+        ) {
+            Ok(symbol) => symbol,
+            Err(_) => {
+                $symbol_scratch.clear();
+                $symbol_scratch.push_str(ghostty_blank_symbol_for_width($wide));
+                $symbol_scratch.as_str()
+            }
+        };
+        (symbol, style)
+    }};
+}
+
 fn decscusr_cursor_shape(style: crate::ghostty::CursorVisualStyle, blinking: bool) -> u8 {
     match (style, blinking) {
         (crate::ghostty::CursorVisualStyle::Block, true)
@@ -206,6 +252,13 @@ pub(crate) struct GhosttyPaneCore {
     pub kitty_keyboard: KittyKeyboardTracker,
     pub initial_default_foreground: Option<crate::ghostty::RgbColor>,
     pub initial_default_background: Option<crate::ghostty::RgbColor>,
+    // Default-color state recorded at the last successful full push
+    // (dirty-patch collect or full render). `ghostty_collect_dirty_patch`
+    // compares the current channels against this to catch default-color
+    // moves (OSC 10/11, host theme) that ghostty reports as Clean because no
+    // cell changed, even though the recomposed appearance of every previously
+    // pushed default cell may differ from what the client holds.
+    last_baked_default_colors: Option<BakedDefaultColors>,
     pub host_terminal_theme: crate::terminal_theme::TerminalTheme,
     pub transient_default_color_owner_pgid: Option<u32>,
     pub default_color_tracker: DefaultColorOscTracker,
@@ -1192,6 +1245,7 @@ impl GhosttyPaneTerminal {
                 kitty_keyboard: KittyKeyboardTracker::default(),
                 initial_default_foreground,
                 initial_default_background,
+                last_baked_default_colors: None,
                 host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
                 transient_default_color_owner_pgid: None,
                 default_color_tracker: DefaultColorOscTracker::default(),
@@ -2372,22 +2426,20 @@ impl GhosttyPaneTerminal {
             terminal,
             render_state,
             decscusr_tracker,
+            last_baked_default_colors,
             ..
         } = &mut *core;
         if render_state.update(terminal).is_err() {
             return;
         }
         let colors = render_state.colors().ok();
-        let default_bg = colors
-            .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
-        let default_fg = colors
-            .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
-        let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
-        let resolved_bg = colors.map(|c| ghostty_color(c.background));
-        let palette_overrides = colors
-            .zip(terminal.default_palette().ok())
-            .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
-        let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+        let defaults = ghostty_render_defaults(
+            colors,
+            terminal.default_palette().ok(),
+            host_theme,
+            initial_default_foreground,
+            initial_default_background,
+        );
 
         let mut row_iterator = match crate::ghostty::RowIterator::new() {
             Ok(iterator) => iterator,
@@ -2414,29 +2466,14 @@ impl GhosttyPaneTerminal {
                 let mut x = 0u16;
                 while x < area.width && cells.next() {
                     let basic = cells.basic_data().unwrap_or_default();
-                    let style = ghostty_cell_style(
-                        &cells,
-                        &basic,
-                        default_fg,
-                        default_bg,
-                        resolved_fg,
-                        resolved_bg,
-                        palette_overrides.as_ref(),
-                    );
-                    let symbol = match ghostty_buffer_symbol_into(
-                        &cells,
+                    let (symbol, style) = ghostty_cell_symbol_and_style!(
+                        cells,
+                        basic,
                         basic.wide,
-                        hide_kitty_placeholders,
-                        &mut grapheme_bytes,
-                        &mut symbol_scratch,
-                    ) {
-                        Ok(symbol) => symbol,
-                        Err(_) => {
-                            symbol_scratch.clear();
-                            symbol_scratch.push_str(ghostty_blank_symbol_for_width(basic.wide));
-                            symbol_scratch.as_str()
-                        }
-                    };
+                        defaults,
+                        grapheme_bytes,
+                        symbol_scratch
+                    );
                     let cell = &mut buf[(area.x + x, area.y + y)];
                     cell.reset();
                     cell.set_symbol(symbol);
@@ -2445,7 +2482,7 @@ impl GhosttyPaneTerminal {
                 }
                 while x < area.width {
                     let cell = &mut buf[(area.x + x, area.y + y)];
-                    ghostty_reset_cell(cell, default_fg, default_bg);
+                    ghostty_reset_cell(cell, defaults.default_fg, defaults.default_bg);
                     x += 1;
                 }
                 y += 1;
@@ -2453,13 +2490,17 @@ impl GhosttyPaneTerminal {
             while y < area.height {
                 for x in 0..area.width {
                     let cell = &mut buf[(area.x + x, area.y + y)];
-                    ghostty_reset_cell(cell, default_fg, default_bg);
+                    ghostty_reset_cell(cell, defaults.default_fg, defaults.default_bg);
                 }
                 y += 1;
             }
         }
 
         ghostty_clear_render_dirty(render_state, area.height);
+        // The full render recomposed every visible cell with these defaults;
+        // record them so the next collect does not force a redundant
+        // full-viewport patch for a change this render already delivered.
+        *last_baked_default_colors = Some(record_default_colors(terminal, &defaults));
 
         let current_cursor = cursor_state_from_render_state(render_state, decscusr_tracker);
         if show_cursor {
@@ -2656,96 +2697,129 @@ fn ghostty_collect_dirty_patch(
     let GhosttyPaneCore {
         terminal,
         render_state,
+        last_baked_default_colors,
         ..
     } = core;
     if render_state.update(terminal).is_err() {
         fallback!("render_state_update_error");
     }
-    match render_state.dirty() {
-        Ok(crate::ghostty::Dirty::Clean) => finish!(TerminalDirtyPatchOutcome::Clean),
-        Ok(crate::ghostty::Dirty::Partial | crate::ghostty::Dirty::Full) => {}
-        Err(_) => fallback!("dirty_read_error"),
-    }
-
     let colors = render_state.colors().ok();
-    let default_bg = colors
-        .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
-    let default_fg = colors
-        .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
-    let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
-    let resolved_bg = colors.map(|c| ghostty_color(c.background));
-    let palette_overrides = colors
-        .zip(terminal.default_palette().ok())
-        .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
-    let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+    let defaults = ghostty_render_defaults(
+        colors,
+        terminal.default_palette().ok(),
+        host_theme,
+        initial_default_foreground,
+        initial_default_background,
+    );
+
+    // ghostty reports Clean when ONLY the default colors move (OSC 10/11,
+    // host theme): no cell changed so row bits stay clear, yet every blank
+    // or default-attribute cell the client already holds was baked with the
+    // previous defaults and recomposes differently now. When the derived
+    // defaults differ from the pair the last successful collect or full
+    // render baked, deliver the full-render payload as a patch: recompose the
+    // entire viewport with the CURRENT defaults. Every pending dirty row's
+    // current content is included in that push before the bits are cleared,
+    // so no dirty state is dropped; a mid-loop fallback stores nothing, so
+    // the next collect re-detects the change and retries. A first-ever
+    // collection only records the pair (nothing was pushed that could go
+    // stale). OSC 4 palette drift is a same-class candidate follow-up (out of
+    // scope here; its migration gate is green).
+    // The watched state spans both default-color channels ghostty exposes:
+    // the render-state derived pair (config/theme colors) and the terminal
+    // effective colors (OSC 10/11 overrides plus host theme option writes);
+    // a move on either channel forces the re-push.
+    let baked = record_default_colors(terminal, &defaults);
+    let defaults_changed = last_baked_default_colors.is_some_and(|previous| previous != baked);
+
+    let mut grapheme_bytes = Vec::new();
+    let mut symbol_scratch = String::new();
+    let blank = blank_cell_data(defaults.default_fg, defaults.default_bg);
+
+    let Ok(mut row_cells) = crate::ghostty::RowCells::new() else {
+        fallback!("row_cells_new_error");
+    };
+    macro_rules! collect_row {
+        ($rows:ident, $bake_blanks:expr) => {{
+            match $rows.selection() {
+                Ok(None) => {}
+                Ok(Some(_)) => fallback!("row_selection_present"),
+                Err(_) => fallback!("row_selection_error"),
+            }
+            let Ok(mut cells) = $rows.populate_cells(&mut row_cells) else {
+                fallback!("populate_cells_error");
+            };
+            let mut patch_cells = Vec::with_capacity(usize::from(area_width));
+            let mut x = 0u16;
+            while x < area_width && cells.next() {
+                match cells.is_default_blank() {
+                    Ok(true) if $bake_blanks => {
+                        patch_cells.push(blank.clone());
+                        x += 1;
+                        continue;
+                    }
+                    Ok(true) | Ok(false) => {}
+                    Err(_) => fallback!("raw_cell_error"),
+                }
+                let Ok(basic) = cells.basic_data() else {
+                    fallback!("basic_data_error");
+                };
+                if basic.has_hyperlink {
+                    fallback!("hyperlink_present");
+                }
+                let (symbol, style) = ghostty_cell_symbol_and_style!(
+                    cells,
+                    basic,
+                    basic.wide,
+                    defaults,
+                    grapheme_bytes,
+                    symbol_scratch
+                );
+                patch_cells.push(cell_data_from_style(symbol.to_owned(), style));
+                x += 1;
+            }
+            patch_cells.resize(usize::from(area_width), blank.clone());
+            patch_cells
+        }};
+    }
 
     let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
         fallback!("row_iterator_new_error");
     };
-    let Ok(mut row_cells) = crate::ghostty::RowCells::new() else {
-        fallback!("row_cells_new_error");
-    };
     let Ok(mut rows) = render_state.populate_row_iterator(&mut row_iterator) else {
         fallback!("populate_rows_error");
     };
-    let mut grapheme_bytes = Vec::new();
-    let mut symbol_scratch = String::new();
     let mut patch_rows = Vec::new();
-    let blank = blank_cell_data(default_fg, default_bg);
+    if defaults_changed {
+        let mut y = 0u16;
+        while y < area_height && rows.next() {
+            patch_rows.push((y, collect_row!(rows, false)));
+            y += 1;
+        }
+        while y < area_height {
+            patch_rows.push((y, vec![blank.clone(); usize::from(area_width)]));
+            y += 1;
+        }
+        drop(rows);
+        ghostty_clear_render_dirty(render_state, area_height);
+        *last_baked_default_colors = Some(baked);
+        finish!(TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch {
+            rows: patch_rows
+        }));
+    }
+    match render_state.dirty() {
+        Ok(crate::ghostty::Dirty::Clean) => {
+            *last_baked_default_colors = Some(baked);
+            finish!(TerminalDirtyPatchOutcome::Clean)
+        }
+        Ok(crate::ghostty::Dirty::Partial | crate::ghostty::Dirty::Full) => {}
+        Err(_) => fallback!("dirty_read_error"),
+    }
     while let Some(y) = rows.next_dirty() {
         if y >= area_height {
             break;
         }
-        match rows.selection() {
-            Ok(None) => {}
-            Ok(Some(_)) => fallback!("row_selection_present"),
-            Err(_) => fallback!("row_selection_error"),
-        }
-        let Ok(mut cells) = rows.populate_cells(&mut row_cells) else {
-            fallback!("populate_cells_error");
-        };
-        let mut patch_cells = Vec::with_capacity(usize::from(area_width));
-        let mut x = 0u16;
-        while x < area_width && cells.next() {
-            match cells.is_default_blank() {
-                Ok(true) => {
-                    patch_cells.push(blank.clone());
-                    x += 1;
-                    continue;
-                }
-                Ok(false) => {}
-                Err(_) => fallback!("raw_cell_error"),
-            }
-            let Ok(basic) = cells.basic_data() else {
-                fallback!("basic_data_error");
-            };
-            if basic.has_hyperlink {
-                fallback!("hyperlink_present");
-            }
-            let style = ghostty_cell_style(
-                &cells,
-                &basic,
-                default_fg,
-                default_bg,
-                resolved_fg,
-                resolved_bg,
-                palette_overrides.as_ref(),
-            );
-            let symbol = match ghostty_buffer_symbol_into(
-                &cells,
-                basic.wide,
-                hide_kitty_placeholders,
-                &mut grapheme_bytes,
-                &mut symbol_scratch,
-            ) {
-                Ok(symbol) => symbol.to_owned(),
-                Err(_) => ghostty_blank_symbol_for_width(basic.wide).to_owned(),
-            };
-            patch_cells.push(cell_data_from_style(symbol, style));
-            x += 1;
-        }
-        patch_cells.resize(usize::from(area_width), blank.clone());
-        patch_rows.push((y, patch_cells));
+        patch_rows.push((y, collect_row!(rows, true)));
     }
 
     // Nothing above mutates dirty state. Only clear it after every row has
@@ -2774,6 +2848,9 @@ fn ghostty_collect_dirty_patch(
         fallback!("set_clean_error");
     }
 
+    // The client surface now equals a full recomposition; record the pair
+    // this patch baked so a later default-free collect stays Clean.
+    *last_baked_default_colors = Some(baked);
     finish!(TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch {
         rows: patch_rows
     }));
@@ -3281,6 +3358,70 @@ fn ghostty_default_style(default_fg: Option<Color>, default_bg: Option<Color>) -
     }
     style
 }
+
+/// Default colors and per-render options derived once per collect/render so
+/// BOTH paths (frame-buffer full render and dirty-patch collect) bake cells
+/// from identical inputs.
+struct GhosttyRenderDefaults {
+    default_fg: Option<Color>,
+    default_bg: Option<Color>,
+    resolved_fg: Option<Color>,
+    resolved_bg: Option<Color>,
+    palette_overrides: Option<PaletteOverrides>,
+    hide_kitty_placeholders: bool,
+}
+
+fn ghostty_render_defaults(
+    colors: Option<crate::ghostty::RenderColors>,
+    default_palette: Option<[crate::ghostty::RgbColor; 256]>,
+    host_theme: crate::terminal_theme::TerminalTheme,
+    initial_default_foreground: Option<crate::ghostty::RgbColor>,
+    initial_default_background: Option<crate::ghostty::RgbColor>,
+) -> GhosttyRenderDefaults {
+    let default_bg = colors
+        .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
+    let default_fg = colors
+        .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
+    GhosttyRenderDefaults {
+        default_fg,
+        default_bg,
+        resolved_fg: colors.map(|c| ghostty_color(c.foreground)),
+        resolved_bg: colors.map(|c| ghostty_color(c.background)),
+        palette_overrides: colors
+            .zip(default_palette)
+            .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default)),
+        hide_kitty_placeholders: crate::kitty_graphics::is_enabled(),
+    }
+}
+
+/// Default-color state recorded at every successful full push (dirty-patch
+/// collect or full render). ghostty exposes default-color changes on two
+/// channels: the render-state derived pair (config/theme colors; frozen
+/// under OSC per the vendored lib) and the terminal EFFECTIVE colors (OSC
+/// 10/11 overrides plus host theme option writes; verified live). A move on
+/// EITHER channel means the recomposed appearance of every default cell
+/// pushed so far may differ from what the client holds, so the collect path
+/// forces a full-viewport re-push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BakedDefaultColors {
+    effective_fg: Option<crate::ghostty::RgbColor>,
+    effective_bg: Option<crate::ghostty::RgbColor>,
+    derived_fg: Option<Color>,
+    derived_bg: Option<Color>,
+}
+
+fn record_default_colors(
+    terminal: &crate::ghostty::Terminal,
+    defaults: &GhosttyRenderDefaults,
+) -> BakedDefaultColors {
+    BakedDefaultColors {
+        effective_fg: terminal.effective_foreground_color().ok().flatten(),
+        effective_bg: terminal.effective_background_color().ok().flatten(),
+        derived_fg: defaults.default_fg,
+        derived_bg: defaults.default_bg,
+    }
+}
+
 
 fn ghostty_cell_style(
     cells: &crate::ghostty::RowCellIter<'_>,
