@@ -1732,7 +1732,11 @@ impl GhosttyPaneTerminal {
                 core.terminal.track_row(0);
             }
 
-            if core.terminal.resize(cols, rows, cell_width_px, cell_height_px).is_err() {
+            if core
+                .terminal
+                .resize(cols, rows, cell_width_px, cell_height_px)
+                .is_err()
+            {
                 return Vec::new();
             }
             core.last_resize_geometry = Some(geometry);
