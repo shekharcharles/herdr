@@ -200,6 +200,8 @@ pub(crate) struct GhosttyPaneCore {
     pub dirty_collection_hook: Option<Box<dyn FnOnce() + Send>>,
     pub terminal: crate::ghostty::Terminal,
     synchronized_output_epoch: u64,
+    // Avoid redundant PTY resizes and repeated scrollback recovery.
+    last_resize_geometry: Option<(u16, u16, u32, u32)>,
     #[cfg(windows)]
     recent_fallback: windows_recent_fallback::Cache,
     pub render_state: crate::ghostty::RenderState,
@@ -1186,6 +1188,7 @@ impl GhosttyPaneTerminal {
                 dirty_collection_hook: None,
                 terminal,
                 synchronized_output_epoch: 0,
+                last_resize_geometry: None,
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
@@ -1686,6 +1689,10 @@ impl GhosttyPaneTerminal {
         cell_height_px: u32,
     ) -> Vec<Bytes> {
         if let Ok(mut core) = self.core.lock() {
+            let geometry = (rows, cols, cell_width_px, cell_height_px);
+            if core.last_resize_geometry == Some(geometry) {
+                return Vec::new();
+            }
             let synchronized_output_before = core
                 .terminal
                 .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
@@ -1725,9 +1732,14 @@ impl GhosttyPaneTerminal {
                 core.terminal.track_row(0);
             }
 
-            let _ = core
+            if core
                 .terminal
-                .resize(cols, rows, cell_width_px, cell_height_px);
+                .resize(cols, rows, cell_width_px, cell_height_px)
+                .is_err()
+            {
+                return Vec::new();
+            }
+            core.last_resize_geometry = Some(geometry);
             let synchronized_output_after = core
                 .terminal
                 .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
@@ -6022,6 +6034,25 @@ mod tests {
                 viewport_rows: 3,
             })
         );
+    }
+
+    #[test]
+    fn repeated_identical_resize_does_not_reflow_or_emit_resize_reports() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(25, 4, 10_000).unwrap();
+        terminal.mode_set(2048, true).unwrap();
+        terminal.write(b"first line\r\nsecond line\r\nthird line\r\nfourth line");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        assert!(!pane.resize(4, 25, 9, 18).is_empty());
+        let before = pane.visible_text();
+        let metrics = pane.scroll_metrics();
+        for _ in 0..25 {
+            assert!(pane.resize(4, 25, 9, 18).is_empty());
+            assert_eq!(pane.visible_text(), before);
+            assert_eq!(pane.scroll_metrics(), metrics);
+        }
+        assert!(!pane.resize(5, 25, 9, 18).is_empty());
+        assert_eq!(pane.scroll_metrics().unwrap().viewport_rows, 5);
     }
 
     #[test]
