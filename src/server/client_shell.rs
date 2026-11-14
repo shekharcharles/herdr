@@ -314,6 +314,11 @@ pub(super) fn render_pane_surface(
                     return Err(SurfaceRenderDeferred::Synchronized);
                 }
                 let revision = runtime.content_seq();
+                // Odd revisions mean a PTY update is still in progress. Do not
+                // sample that intermediate state as the start of a frame.
+                if revision % 2 != 0 {
+                    return Err(SurfaceRenderDeferred::Changed);
+                }
                 content_revisions_before.insert(pane.id, (epoch, revision));
             }
         }
@@ -332,7 +337,11 @@ pub(super) fn render_pane_surface(
                 if synchronized {
                     return Err(SurfaceRenderDeferred::Synchronized);
                 }
-                Ok((epoch, runtime.content_seq()))
+                let revision = runtime.content_seq();
+                if revision % 2 != 0 {
+                    return Err(SurfaceRenderDeferred::Changed);
+                }
+                Ok((epoch, revision))
             })
             .transpose()?
     } else {
