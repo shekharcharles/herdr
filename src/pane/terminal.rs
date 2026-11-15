@@ -1709,6 +1709,16 @@ impl GhosttyPaneTerminal {
                         .saturating_sub(scrollbar.offset + scrollbar.len)
                 })
                 .unwrap_or(0);
+            // A resize may temporarily leave the bottom viewport blank while
+            // Ghostty is reflowing primary-screen history. Replaying a snapshot
+            // containing scrollback writes *new* terminal output rather than
+            // repairing the existing cells, duplicating OMP tables on each drag.
+            // Only consider recovery for a screen with no history to duplicate.
+            let no_scrollback_before_resize = core
+                .terminal
+                .scrollbar()
+                .ok()
+                .is_some_and(|scrollbar| scrollbar.total <= scrollbar.len);
             let bottom_before_resize = ghostty_detection_text(&mut core)
                 .map(|text| !text.trim().is_empty())
                 .unwrap_or(false);
@@ -1717,9 +1727,12 @@ impl GhosttyPaneTerminal {
                 .max(DEFAULT_DETECTION_ROWS);
             let replay_ansi = if core.terminal.active_screen().ok()
                 == Some(crate::ghostty::ActiveScreen::Primary)
+                && no_scrollback_before_resize
+                && offset_from_bottom == 0
+                && !synchronized_output_before
                 && bottom_before_resize
             {
-                ghostty_recent_ansi(&mut core, resize_recovery_probe_lines, true)
+                ghostty_recent_ansi(&mut core, usize::from(rows), true)
                     .ok()
                     .filter(|ansi| !ansi.trim().is_empty())
             } else {
@@ -1749,10 +1762,16 @@ impl GhosttyPaneTerminal {
             }
             let terminal_responses = self.drain_pending_pty_responses();
 
+            // Both the live viewport and bottom detection must be empty before
+            // any recovery write. A blank bottom alone is not proof that a
+            // primary-screen resize lost content; especially with OMP reflow.
             let bottom_is_blank = ghostty_detection_text(&mut core)
                 .map(|text| text.trim().is_empty())
                 .unwrap_or(false);
-            if bottom_is_blank {
+            let visible_is_blank = ghostty_visible_text(&mut core)
+                .map(|text| text.trim().is_empty())
+                .unwrap_or(false);
+            if bottom_is_blank && visible_is_blank && !synchronized_output_after {
                 if let Some(ansi) = replay_ansi.as_deref() {
                     core.terminal.scroll_viewport_bottom();
                     core.terminal.write(ansi.as_bytes());
@@ -6097,6 +6116,28 @@ mod tests {
             assert!(
                 pane.detection_text().contains("END"),
                 "bottom detection should remain independent from the scrolled viewport after resize"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_resizes_do_not_duplicate_primary_screen_table_history() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(64, 5, 100_000).unwrap();
+        for i in 0..30 {
+            terminal.write(format!("| phase-{i:02} | once-{i:02} | check |\\r\\n").as_bytes());
+        }
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let original = pane.recent_unwrapped_text(256);
+        assert_eq!(original.matches("once-15").count(), 1);
+
+        for (rows, cols) in [(5, 45), (5, 80), (7, 50), (5, 64), (6, 42)] {
+            pane.resize(rows, cols, 0, 0);
+            let history = pane.recent_unwrapped_text(512);
+            assert_eq!(
+                history.matches("once-15").count(),
+                1,
+                "resize to {rows}x{cols} duplicated or lost the table row: {history:?}"
             );
         }
     }
