@@ -314,10 +314,19 @@ pub(super) fn render_pane_surface(
                     return Err(SurfaceRenderDeferred::Synchronized);
                 }
                 let revision = runtime.content_seq();
+                // Odd revisions mean a PTY update is still in progress. Do not
+                // sample that intermediate state as the start of a frame.
+                if revision % 2 != 0 {
+                    return Err(SurfaceRenderDeferred::Changed);
+                }
                 content_revisions_before.insert(pane.id, (epoch, revision));
             }
         }
     }
+    // A synchronized-output epoch detects DECSET 2026 transitions, but ordinary
+    // PTY writes can also change a pane while its surface is being composed.
+    // Reject such mixed snapshots rather than publishing rows from different
+    // content revisions as one coherent frame.
     let popup_revision_before = if show_popup {
         app.state
             .popup_pane
@@ -328,7 +337,11 @@ pub(super) fn render_pane_surface(
                 if synchronized {
                     return Err(SurfaceRenderDeferred::Synchronized);
                 }
-                Ok(epoch)
+                let revision = runtime.content_seq();
+                if revision % 2 != 0 {
+                    return Err(SurfaceRenderDeferred::Changed);
+                }
+                Ok((epoch, revision))
             })
             .transpose()?
     } else {
@@ -451,7 +464,7 @@ pub(super) fn render_pane_surface(
             client_id,
         );
     if let Some(target) = target {
-        for (&pane_id, &(epoch, _)) in &content_revisions_before {
+        for (&pane_id, &(epoch, content_seq)) in &content_revisions_before {
             if let Some(runtime) = app.state.runtime_for_pane_in_workspace(
                 &app.terminal_runtimes,
                 target.workspace_index,
@@ -461,13 +474,13 @@ pub(super) fn render_pane_surface(
                 if synchronized {
                     return Err(SurfaceRenderDeferred::Synchronized);
                 }
-                if after_epoch != epoch {
+                if after_epoch != epoch || runtime.content_seq() != content_seq {
                     return Err(SurfaceRenderDeferred::Changed);
                 }
             }
         }
     }
-    if let Some(before) = popup_revision_before {
+    if let Some((before_epoch, before_content_seq)) = popup_revision_before {
         if let Some(runtime) = app
             .state
             .popup_pane
@@ -478,7 +491,7 @@ pub(super) fn render_pane_surface(
             if synchronized {
                 return Err(SurfaceRenderDeferred::Synchronized);
             }
-            if after_epoch != before {
+            if after_epoch != before_epoch || runtime.content_seq() != before_content_seq {
                 return Err(SurfaceRenderDeferred::Changed);
             }
         }

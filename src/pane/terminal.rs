@@ -200,6 +200,8 @@ pub(crate) struct GhosttyPaneCore {
     pub dirty_collection_hook: Option<Box<dyn FnOnce() + Send>>,
     pub terminal: crate::ghostty::Terminal,
     synchronized_output_epoch: u64,
+    // Avoid redundant PTY resizes and repeated scrollback recovery.
+    last_resize_geometry: Option<(u16, u16, u32, u32)>,
     #[cfg(windows)]
     recent_fallback: windows_recent_fallback::Cache,
     pub render_state: crate::ghostty::RenderState,
@@ -1186,6 +1188,7 @@ impl GhosttyPaneTerminal {
                 dirty_collection_hook: None,
                 terminal,
                 synchronized_output_epoch: 0,
+                last_resize_geometry: None,
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
@@ -1686,6 +1689,10 @@ impl GhosttyPaneTerminal {
         cell_height_px: u32,
     ) -> Vec<Bytes> {
         if let Ok(mut core) = self.core.lock() {
+            let geometry = (rows, cols, cell_width_px, cell_height_px);
+            if core.last_resize_geometry == Some(geometry) {
+                return Vec::new();
+            }
             let synchronized_output_before = core
                 .terminal
                 .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
@@ -1702,6 +1709,16 @@ impl GhosttyPaneTerminal {
                         .saturating_sub(scrollbar.offset + scrollbar.len)
                 })
                 .unwrap_or(0);
+            // A resize may temporarily leave the bottom viewport blank while
+            // Ghostty is reflowing primary-screen history. Replaying a snapshot
+            // containing scrollback writes *new* terminal output rather than
+            // repairing the existing cells, duplicating OMP tables on each drag.
+            // Only consider recovery for a screen with no history to duplicate.
+            let no_scrollback_before_resize = core
+                .terminal
+                .scrollbar()
+                .ok()
+                .is_some_and(|scrollbar| scrollbar.total <= scrollbar.len);
             let bottom_before_resize = ghostty_detection_text(&mut core)
                 .map(|text| !text.trim().is_empty())
                 .unwrap_or(false);
@@ -1710,9 +1727,12 @@ impl GhosttyPaneTerminal {
                 .max(DEFAULT_DETECTION_ROWS);
             let replay_ansi = if core.terminal.active_screen().ok()
                 == Some(crate::ghostty::ActiveScreen::Primary)
+                && no_scrollback_before_resize
+                && offset_from_bottom == 0
+                && !synchronized_output_before
                 && bottom_before_resize
             {
-                ghostty_recent_ansi(&mut core, resize_recovery_probe_lines, true)
+                ghostty_recent_ansi(&mut core, usize::from(rows), true)
                     .ok()
                     .filter(|ansi| !ansi.trim().is_empty())
             } else {
@@ -1725,9 +1745,19 @@ impl GhosttyPaneTerminal {
                 core.terminal.track_row(0);
             }
 
-            let _ = core
+            if core
                 .terminal
-                .resize(cols, rows, cell_width_px, cell_height_px);
+                .resize(cols, rows, cell_width_px, cell_height_px)
+                .is_err()
+            {
+                return Vec::new();
+            }
+            // A real geometry change invalidates every cached viewport row.
+            // Force libghostty's render state to repopulate the complete screen
+            // before Herdr paints the next frame; partial dirty rows from the old
+            // geometry must not be reused at the new row/column coordinates.
+            let _ = core.render_state.set_dirty(crate::ghostty::Dirty::Full);
+            core.last_resize_geometry = Some(geometry);
             let synchronized_output_after = core
                 .terminal
                 .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
@@ -1737,10 +1767,16 @@ impl GhosttyPaneTerminal {
             }
             let terminal_responses = self.drain_pending_pty_responses();
 
+            // Both the live viewport and bottom detection must be empty before
+            // any recovery write. A blank bottom alone is not proof that a
+            // primary-screen resize lost content; especially with OMP reflow.
             let bottom_is_blank = ghostty_detection_text(&mut core)
                 .map(|text| text.trim().is_empty())
                 .unwrap_or(false);
-            if bottom_is_blank {
+            let visible_is_blank = ghostty_visible_text(&mut core)
+                .map(|text| text.trim().is_empty())
+                .unwrap_or(false);
+            if bottom_is_blank && visible_is_blank && !synchronized_output_after {
                 if let Some(ansi) = replay_ansi.as_deref() {
                     core.terminal.scroll_viewport_bottom();
                     core.terminal.write(ansi.as_bytes());
@@ -6025,6 +6061,57 @@ mod tests {
     }
 
     #[test]
+    fn real_resize_invalidates_the_full_ghostty_render_state() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(25, 4, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        {
+            let mut core = pane.core.lock().unwrap();
+            let GhosttyPaneCore {
+                render_state,
+                terminal,
+                ..
+            } = &mut *core;
+            render_state.update(terminal).unwrap();
+            core.render_state
+                .set_dirty(crate::ghostty::Dirty::Clean)
+                .unwrap();
+            assert_eq!(
+                core.render_state.dirty().unwrap(),
+                crate::ghostty::Dirty::Clean
+            );
+        }
+
+        pane.resize(5, 30, 9, 18);
+
+        let core = pane.core.lock().unwrap();
+        assert_eq!(
+            core.render_state.dirty().unwrap(),
+            crate::ghostty::Dirty::Full
+        );
+    }
+
+    #[test]
+    fn repeated_identical_resize_does_not_reflow_or_emit_resize_reports() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(25, 4, 10_000).unwrap();
+        terminal.mode_set(2048, true).unwrap();
+        terminal.write(b"first line\r\nsecond line\r\nthird line\r\nfourth line");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        assert!(!pane.resize(4, 25, 9, 18).is_empty());
+        let before = pane.visible_text();
+        let metrics = pane.scroll_metrics();
+        for _ in 0..25 {
+            assert!(pane.resize(4, 25, 9, 18).is_empty());
+            assert_eq!(pane.visible_text(), before);
+            assert_eq!(pane.scroll_metrics(), metrics);
+        }
+        assert!(!pane.resize(5, 25, 9, 18).is_empty());
+        assert_eq!(pane.scroll_metrics().unwrap().viewport_rows, 5);
+    }
+
+    #[test]
     fn resize_reflow_keeps_scrolled_viewport_and_bottom_detection_sane() {
         let (tx, _rx) = mpsc::channel(4);
         let mut terminal = crate::ghostty::Terminal::new(12, 4, 10_000).unwrap();
@@ -6066,6 +6153,28 @@ mod tests {
             assert!(
                 pane.detection_text().contains("END"),
                 "bottom detection should remain independent from the scrolled viewport after resize"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_resizes_do_not_duplicate_primary_screen_table_history() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(64, 5, 100_000).unwrap();
+        for i in 0..30 {
+            terminal.write(format!("| phase-{i:02} | once-{i:02} | check |\\r\\n").as_bytes());
+        }
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let original = pane.recent_unwrapped_text(256);
+        assert_eq!(original.matches("once-15").count(), 1);
+
+        for (rows, cols) in [(5, 45), (5, 80), (7, 50), (5, 64), (6, 42)] {
+            pane.resize(rows, cols, 0, 0);
+            let history = pane.recent_unwrapped_text(512);
+            assert_eq!(
+                history.matches("once-15").count(),
+                1,
+                "resize to {rows}x{cols} duplicated or lost the table row: {history:?}"
             );
         }
     }
