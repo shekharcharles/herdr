@@ -6068,7 +6068,11 @@ mod tests {
 
         {
             let mut core = pane.core.lock().unwrap();
-            let GhosttyPaneCore { render_state, terminal, .. } = &mut *core;
+            let GhosttyPaneCore {
+                render_state,
+                terminal,
+                ..
+            } = &mut *core;
             render_state.update(terminal).unwrap();
             core.render_state
                 .set_dirty(crate::ghostty::Dirty::Clean)
