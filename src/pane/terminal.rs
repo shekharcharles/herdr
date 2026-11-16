@@ -1752,6 +1752,11 @@ impl GhosttyPaneTerminal {
             {
                 return Vec::new();
             }
+            // A real geometry change invalidates every cached viewport row.
+            // Force libghostty's render state to repopulate the complete screen
+            // before Herdr paints the next frame; partial dirty rows from the old
+            // geometry must not be reused at the new row/column coordinates.
+            let _ = core.render_state.set_dirty(crate::ghostty::Dirty::Full);
             core.last_resize_geometry = Some(geometry);
             let synchronized_output_after = core
                 .terminal
@@ -6053,6 +6058,25 @@ mod tests {
                 viewport_rows: 3,
             })
         );
+    }
+
+    #[test]
+    fn real_resize_invalidates_the_full_ghostty_render_state() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(25, 4, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        {
+            let mut core = pane.core.lock().unwrap();
+            core.render_state.update(&core.terminal).unwrap();
+            core.render_state.set_dirty(crate::ghostty::Dirty::Clean).unwrap();
+            assert_eq!(core.render_state.dirty().unwrap(), crate::ghostty::Dirty::Clean);
+        }
+
+        pane.resize(5, 30, 9, 18);
+
+        let core = pane.core.lock().unwrap();
+        assert_eq!(core.render_state.dirty().unwrap(), crate::ghostty::Dirty::Full);
     }
 
     #[test]
