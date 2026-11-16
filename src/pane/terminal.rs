@@ -6069,14 +6069,22 @@ mod tests {
         {
             let mut core = pane.core.lock().unwrap();
             core.render_state.update(&core.terminal).unwrap();
-            core.render_state.set_dirty(crate::ghostty::Dirty::Clean).unwrap();
-            assert_eq!(core.render_state.dirty().unwrap(), crate::ghostty::Dirty::Clean);
+            core.render_state
+                .set_dirty(crate::ghostty::Dirty::Clean)
+                .unwrap();
+            assert_eq!(
+                core.render_state.dirty().unwrap(),
+                crate::ghostty::Dirty::Clean
+            );
         }
 
         pane.resize(5, 30, 9, 18);
 
         let core = pane.core.lock().unwrap();
-        assert_eq!(core.render_state.dirty().unwrap(), crate::ghostty::Dirty::Full);
+        assert_eq!(
+            core.render_state.dirty().unwrap(),
+            crate::ghostty::Dirty::Full
+        );
     }
 
     #[test]
